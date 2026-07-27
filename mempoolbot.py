@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from websocket import WebSocketApp
 
 # ====================== CONFIGURACIÓN ======================
-TELEGRAM_TOKEN = os.getenv("8954423093:AAFeFLUQ-ZC9Vse6dHVyZQcimDVxvg1HV_E")
-TELEGRAM_CHAT_ID = os.getenv("1278361384")
+TELEGRAM_TOKEN = os.getenv("")
+TELEGRAM_CHAT_ID = os.getenv("")
 
 WS_URL = "wss://mempool.space/api/v1/ws"
 API_BASE = "https://mempool.space/api"
