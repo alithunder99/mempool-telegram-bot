@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Mempool Monitor → Telegram (Versión potente - Opción B)
-Patrón: size=151 + fee=151 + Taproot input + SegWit + RBF disabled
+Mempool Monitor → Telegram
+Filtro: size 151 o 303 bytes + fee 151 sats + Taproot input + SegWit + RBF disabled
+Incluye estimación de monto Lightning real
 """
 
 import os
@@ -59,9 +60,12 @@ def has_segwit(tx: dict) -> bool:
     return False
 
 def matches_criteria(tx: dict) -> bool:
-    if tx.get("size") != 151:
+    size = tx.get("size")
+    fee = tx.get("fee")
+
+    if size not in (151, 303):
         return False
-    if tx.get("fee") != 151:
+    if fee != 151:
         return False
     if not has_taproot_input(tx):
         return False
@@ -79,16 +83,7 @@ def ts_to_str(ts):
     except:
         return str(ts)
 
-def get_tx(txid: str):
-    try:
-        r = requests.get(f"{API_BASE}/tx/{txid}", timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except:
-        pass
-    return None
-
-def get_address_txs(address: str, limit=6):
+def get_address_txs(address: str, limit=5):
     try:
         r = requests.get(f"{API_BASE}/address/{address}/txs", timeout=12)
         if r.status_code == 200:
@@ -96,6 +91,48 @@ def get_address_txs(address: str, limit=6):
     except:
         pass
     return []
+
+def estimate_lightning_amount(tx: dict) -> tuple:
+    """
+    Intenta estimar el monto real del pago Lightning.
+    Retorna (monto_estimado, explicacion)
+    """
+    fee = tx.get("fee", 0)
+    outputs = tx.get("vout", [])
+    ancestors = tx.get("ancestors") or []
+
+    # Output principal (el más grande)
+    main_output = 0
+    for vout in outputs:
+        value = vout.get("value", 0)
+        if value > main_output:
+            main_output = value
+
+    # Caso simple: solo un output grande + fee 151
+    if len(outputs) == 1:
+        estimated = main_output
+        return estimated, "Output único"
+
+    # Caso típico Muun / swap: suele haber un output principal + change pequeño
+    if len(outputs) == 2:
+        values = sorted([v.get("value", 0) for v in outputs], reverse=True)
+        # El más grande suele ser el pago, el pequeño el change
+        estimated = values[0]
+        return estimated, "Output principal (posible pago)"
+
+    # Si hay ancestors, intentamos ser un poco más inteligentes
+    if ancestors:
+        # Sumamos fees de ancestors + fee actual para tener una idea
+        total_related_fee = fee
+        for anc in ancestors:
+            total_related_fee += anc.get("fee", 0)
+
+        # Estimación conservadora
+        estimated = main_output
+        return estimated, f"Con {len(ancestors)} ancestors"
+
+    # Por defecto
+    return main_output, "Estimación básica"
 
 def analyze_and_notify(tx: dict):
     txid = tx.get("txid")
@@ -107,91 +144,70 @@ def analyze_and_notify(tx: dict):
     num_inputs = len(tx.get("vin", []))
     num_outputs = len(tx.get("vout", []))
 
-    # === Inputs ===
+    # Inputs
     inputs_text = ""
     origin_addresses = []
-    total_input = 0
 
     for vin in tx.get("vin", []):
         prevout = vin.get("prevout") or {}
         addr = prevout.get("scriptpubkey_address", "?")
         value = prevout.get("value", 0)
         spk = prevout.get("scriptpubkey_type", "?")
-        total_input += value
-        inputs_text += f"• {value} sats ← <code>{addr[:14]}...{addr[-6:]}</code> ({spk})\n"
+        inputs_text += f"• {value} sats ← <code>{addr[:16]}...{addr[-6:]}</code> ({spk})\n"
         if addr.startswith("bc1"):
             origin_addresses.append(addr)
 
-    # === Outputs ===
+    # Outputs
     outputs_text = ""
-    main_output_value = 0
-    main_output_addr = ""
-
     for vout in tx.get("vout", []):
         addr = vout.get("scriptpubkey_address") or "OP_RETURN"
         value = vout.get("value", 0)
         spk = vout.get("scriptpubkey_type", "?")
-        outputs_text += f"• {value} sats → <code>{addr[:14]}...{addr[-6:]}</code> ({spk})\n"
-        if value > main_output_value and addr.startswith("bc1"):
-            main_output_value = value
-            main_output_addr = addr
+        outputs_text += f"• {value} sats → <code>{addr[:16]}...{addr[-6:]}</code> ({spk})\n"
 
-    # === Ancestors / CPFP ===
+    # Ancestors
     ancestors = tx.get("ancestors") or []
     effective_fee = tx.get("effectiveFeePerVsize") or fee_rate
     ancestors_text = ""
     if ancestors:
-        ancestors_text = f"\n🔗 <b>Ancestors (CPFP):</b> {len(ancestors)} tx(s)\n"
-        ancestors_text += f"Fee efectiva: <b>{effective_fee:.2f} sat/vB</b>\n"
+        ancestors_text = f"\n🔗 Ancestors: {len(ancestors)} | Fee efectiva: <b>{effective_fee:.2f} sat/vB</b>\n"
 
-    # === Detección patrón Lightning / Muun ===
-    is_likely_lightning = False
-    estimated_ln_amount = main_output_value
+    # === Estimación de monto Lightning ===
+    ln_amount, ln_reason = estimate_lightning_amount(tx)
 
-    # Heurística simple pero efectiva para el patrón que describes
-    if main_output_value > 0 and fee == 151 and size == 151:
-        is_likely_lightning = True
-        # En muchos casos de Muun el monto Lightning real está cerca del output principal
-        estimated_ln_amount = main_output_value
-
-    lightning_text = ""
-    if is_likely_lightning:
-        lightning_text = f"""
-⚡ <b>Posible pago Lightning (patrón Muun)</b>
-Monto estimado Lightning: <b>{estimated_ln_amount} sats</b>
+    lightning_text = f"""
+⚡ <b>Posible pago Lightning (patrón Muun/Swap)</b>
+Monto estimado Lightning: <b>{ln_amount} sats</b>
+({ln_reason})
 """
 
-    # === Historial un nivel atrás ===
+    # Historial un nivel atrás
     history_text = ""
     if origin_addresses:
         addr = origin_addresses[0]
-        txs = get_address_txs(addr, limit=5)
+        txs = get_address_txs(addr, limit=4)
         txs = list(reversed(txs))
 
-        history_text = "\n📜 <b>Origen de los fondos (1 nivel atrás):</b>\n"
-        for t in txs[:4]:
+        history_text = "\n📜 Origen de los fondos:\n"
+        for t in txs[:3]:
             status = t.get("status", {})
             confirmed = status.get("confirmed", False)
             block_time = status.get("block_time")
             t_txid = t.get("txid", "")[:10] + "..."
             time_str = ts_to_str(block_time) if confirmed else "mempool"
 
-            received = 0
+            received = sum(v.get("value", 0) for v in t.get("vout", []) if v.get("scriptpubkey_address") == addr)
             sent = 0
-            for vout in t.get("vout", []):
-                if vout.get("scriptpubkey_address") == addr:
-                    received += vout.get("value", 0)
             for vin in t.get("vin", []):
                 prev = vin.get("prevout") or {}
                 if prev.get("scriptpubkey_address") == addr:
                     sent += prev.get("value", 0)
 
             if received:
-                history_text += f"• {time_str} | recibió <b>{received}</b> sats | <code>{t_txid}</code>\n"
+                history_text += f"• {time_str} | recibió {received} sats | <code>{t_txid}</code>\n"
             elif sent:
-                history_text += f"• {time_str} | envió <b>{sent}</b> sats | <code>{t_txid}</code>\n"
+                history_text += f"• {time_str} | envió {sent} sats | <code>{t_txid}</code>\n"
 
-    # === Construir mensaje final ===
     msg = f"""
 🎯 <b>MATCH DETECTADO</b>
 
@@ -208,10 +224,10 @@ Monto estimado Lightning: <b>{estimated_ln_amount} sats</b>
 📤 <b>Outputs:</b>
 {outputs_text}
 {history_text}
-— Mempool Bot
+— Mempool Bot v3 (Estimación LN)
 """
 
-    print(f"[MATCH] {txid}")
+    print(f"[MATCH] {txid} | size={size} | LN estimado={ln_amount}")
     send_telegram(msg.strip())
 
 def on_message(ws, message):
@@ -234,8 +250,8 @@ def on_close(ws, close_status_code, close_msg):
     start()
 
 def on_open(ws):
-    print("[INFO] Conectado a mempool.space")
-    send_telegram("🟢 <b>Mempool Bot actualizado</b>\nVersión potente activa.")
+    print("[INFO] Conectado - Filtro 151/303 + Estimación LN")
+    send_telegram("🟢 <b>Mempool Bot v3 iniciado</b>\nFiltro: 151 y 303 bytes + fee 151\n+ Estimación de monto Lightning")
     ws.send(json.dumps({"track-mempool": True}))
 
 def start():
@@ -249,5 +265,5 @@ def start():
     ws.run_forever(ping_interval=25, ping_timeout=10)
 
 if __name__ == "__main__":
-    print("Iniciando Mempool Bot (versión potente)...")
+    print("Iniciando Mempool Bot v3...")
     start()
