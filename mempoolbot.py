@@ -63,7 +63,7 @@ def matches_criteria(tx: dict) -> bool:
     size = tx.get("size")
     fee = tx.get("fee")
 
-    if size not in (151, 303):
+    if size not in (151, 303, 410):
         return False
     if fee != 151:
         return False
