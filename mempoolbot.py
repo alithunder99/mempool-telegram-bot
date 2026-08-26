@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Mempool Monitor → Telegram
-Filtro principal: fee = 70 / 75 / 151 / 303 / 410 / 412 sats
-+ Taproot input + SegWit + RBF disabled
+Filtro: fee 70/75/151/303/410/412 sats
++ Taproot + SegWit + RBF disabled
++ Sin OP_RETURN
 """
 
 import os
@@ -59,18 +60,35 @@ def has_segwit(tx: dict) -> bool:
             return True
     return False
 
+def has_op_return(tx: dict) -> bool:
+    """Devuelve True si la transacción tiene alguna salida OP_RETURN"""
+    for vout in tx.get("vout", []):
+        script_type = vout.get("scriptpubkey_type", "")
+        if script_type == "op_return" or script_type == "nulldata":
+            return True
+        # También revisamos el scriptpubkey por si acaso
+        script = vout.get("scriptpubkey", "")
+        if script.startswith("6a"):  # OP_RETURN en hex
+            return True
+    return False
+
 def matches_criteria(tx: dict) -> bool:
     fee = tx.get("fee")
 
-    # Solo filtramos por la comisión total pagada
+    # Comisión total pagada
     if fee not in (70, 75, 151, 303, 410, 412):
         return False
 
+    # Características requeridas
     if not has_taproot_input(tx):
         return False
     if not has_segwit(tx):
         return False
     if not is_rbf_disabled(tx):
+        return False
+
+    # Excluir transacciones con OP_RETURN
+    if has_op_return(tx):
         return False
 
     return True
@@ -204,7 +222,7 @@ Monto estimado Lightning: <b>{ln_amount} sats</b>
 📤 <b>Outputs:</b>
 {outputs_text}
 {history_text}
-— Mempool Bot v8 (Solo Fee)
+— Mempool Bot v9 (Sin OP_RETURN)
 """
 
     print(f"[MATCH] {txid} | size={size} | fee={fee} | LN estimado={ln_amount}")
@@ -230,13 +248,13 @@ def on_close(ws, close_status_code, close_msg):
     start()
 
 def on_open(ws):
-    print("[INFO] Conectado - Solo Fee: 70/75/151/303/410/412")
+    print("[INFO] Conectado - Fee filter + Sin OP_RETURN")
     send_telegram(
-        "🟢 <b>Mempool Bot v8 iniciado</b>\n"
-        "Filtro activo por <b>comisión total</b>:\n"
-        "• 70 / 75 / 151 / 303 / 410 / 412 sats\n"
-        "• + Taproot + SegWit + RBF off\n"
-        "• Sin restricción de size"
+        "🟢 <b>Mempool Bot v9 iniciado</b>\n"
+        "Filtro activo:\n"
+        "• Fee: <b>70 / 75 / 151 / 303 / 410 / 412 sats</b>\n"
+        "• Taproot + SegWit + RBF off\n"
+        "• <b>Sin OP_RETURN</b>"
     )
     ws.send(json.dumps({"track-mempool": True}))
 
@@ -251,5 +269,5 @@ def start():
     ws.run_forever(ping_interval=25, ping_timeout=10)
 
 if __name__ == "__main__":
-    print("Iniciando Mempool Bot v8...")
+    print("Iniciando Mempool Bot v9...")
     start()
