@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Mempool Monitor → Telegram
-Filtro: size 70/75/151/303/410/412 + fee 70/75/151/303/410/412
+Filtro principal: fee = 70 / 75 / 151 / 303 / 410 / 412 sats
 + Taproot input + SegWit + RBF disabled
 """
 
@@ -60,14 +60,9 @@ def has_segwit(tx: dict) -> bool:
     return False
 
 def matches_criteria(tx: dict) -> bool:
-    size = tx.get("size")
     fee = tx.get("fee")
 
-    # Size aceptados
-    if size not in (70, 75, 151, 303, 410, 412):
-        return False
-
-    # Fee (comisión) aceptados
+    # Solo filtramos por la comisión total pagada
     if fee not in (70, 75, 151, 303, 410, 412):
         return False
 
@@ -209,7 +204,7 @@ Monto estimado Lightning: <b>{ln_amount} sats</b>
 📤 <b>Outputs:</b>
 {outputs_text}
 {history_text}
-— Mempool Bot v7
+— Mempool Bot v8 (Solo Fee)
 """
 
     print(f"[MATCH] {txid} | size={size} | fee={fee} | LN estimado={ln_amount}")
@@ -235,13 +230,13 @@ def on_close(ws, close_status_code, close_msg):
     start()
 
 def on_open(ws):
-    print("[INFO] Conectado - Size + Fee: 70/75/151/303/410/412")
+    print("[INFO] Conectado - Solo Fee: 70/75/151/303/410/412")
     send_telegram(
-        "🟢 <b>Mempool Bot v7 iniciado</b>\n"
-        "Filtro activo:\n"
-        "• Size: <b>70, 75, 151, 303, 410, 412 bytes</b>\n"
-        "• Fee: <b>70, 75, 151, 303, 410, 412 sats</b>\n"
-        "• Taproot + SegWit + RBF off"
+        "🟢 <b>Mempool Bot v8 iniciado</b>\n"
+        "Filtro activo por <b>comisión total</b>:\n"
+        "• 70 / 75 / 151 / 303 / 410 / 412 sats\n"
+        "• + Taproot + SegWit + RBF off\n"
+        "• Sin restricción de size"
     )
     ws.send(json.dumps({"track-mempool": True}))
 
@@ -256,5 +251,5 @@ def start():
     ws.run_forever(ping_interval=25, ping_timeout=10)
 
 if __name__ == "__main__":
-    print("Iniciando Mempool Bot v7...")
+    print("Iniciando Mempool Bot v8...")
     start()
