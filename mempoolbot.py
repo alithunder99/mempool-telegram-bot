@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Mempool Monitor → Telegram
-Filtro principal: fee = 70 / 75 / 151 / 303 / 410 / 412 sats
-+ Taproot input + SegWit + RBF disabled
+Filtro: size 70/75/151/303/410/412 bytes + fee 151 sats + Taproot input + SegWit + RBF disabled
+Incluye estimación de monto Lightning real
 """
 
 import os
@@ -60,13 +60,16 @@ def has_segwit(tx: dict) -> bool:
     return False
 
 def matches_criteria(tx: dict) -> bool:
+    size = tx.get("size")
     fee = tx.get("fee")
 
-    # === FILTRO PRINCIPAL: la comisión (fee) ===
-    if fee not in (70, 75, 151, 303, 410, 412):
+    # Tamaños ampliados
+    if size not in (70, 75, 151, 303, 410, 412):
         return False
 
-    # Características adicionales
+    if fee != 151:
+        return False
+
     if not has_taproot_input(tx):
         return False
     if not has_segwit(tx):
@@ -94,25 +97,45 @@ def get_address_txs(address: str, limit=5):
     return []
 
 def estimate_lightning_amount(tx: dict) -> tuple:
+    """
+    Intenta estimar el monto real del pago Lightning.
+    Retorna (monto_estimado, explicacion)
+    """
+    fee = tx.get("fee", 0)
     outputs = tx.get("vout", [])
     ancestors = tx.get("ancestors") or []
 
+    # Output principal (el más grande)
     main_output = 0
     for vout in outputs:
         value = vout.get("value", 0)
         if value > main_output:
             main_output = value
 
+    # Caso simple: solo un output grande + fee 151
     if len(outputs) == 1:
-        return main_output, "Output único"
+        estimated = main_output
+        return estimated, "Output único"
 
+    # Caso típico Muun / swap: suele haber un output principal + change pequeño
     if len(outputs) == 2:
         values = sorted([v.get("value", 0) for v in outputs], reverse=True)
-        return values[0], "Output principal (posible pago)"
+        # El más grande suele ser el pago, el pequeño el change
+        estimated = values[0]
+        return estimated, "Output principal (posible pago)"
 
+    # Si hay ancestors, intentamos ser un poco más inteligentes
     if ancestors:
-        return main_output, f"Con {len(ancestors)} ancestors"
+        # Sumamos fees de ancestors + fee actual para tener una idea
+        total_related_fee = fee
+        for anc in ancestors:
+            total_related_fee += anc.get("fee", 0)
 
+        # Estimación conservadora
+        estimated = main_output
+        return estimated, f"Con {len(ancestors)} ancestors"
+
+    # Por defecto
     return main_output, "Estimación básica"
 
 def analyze_and_notify(tx: dict):
@@ -153,7 +176,7 @@ def analyze_and_notify(tx: dict):
     if ancestors:
         ancestors_text = f"\n🔗 Ancestors: {len(ancestors)} | Fee efectiva: <b>{effective_fee:.2f} sat/vB</b>\n"
 
-    # Estimación Lightning
+    # === Estimación de monto Lightning ===
     ln_amount, ln_reason = estimate_lightning_amount(tx)
 
     lightning_text = f"""
@@ -162,7 +185,7 @@ Monto estimado Lightning: <b>{ln_amount} sats</b>
 ({ln_reason})
 """
 
-    # Historial
+    # Historial un nivel atrás
     history_text = ""
     if origin_addresses:
         addr = origin_addresses[0]
@@ -205,10 +228,10 @@ Monto estimado Lightning: <b>{ln_amount} sats</b>
 📤 <b>Outputs:</b>
 {outputs_text}
 {history_text}
-— Mempool Bot v6 (Fees: 70/75/151/303/410/412)
+— Mempool Bot v5 (Sizes: 70/75/151/303/410/412)
 """
 
-    print(f"[MATCH] {txid} | size={size} | fee={fee} | LN estimado={ln_amount}")
+    print(f"[MATCH] {txid} | size={size} | LN estimado={ln_amount}")
     send_telegram(msg.strip())
 
 def on_message(ws, message):
@@ -231,12 +254,13 @@ def on_close(ws, close_status_code, close_msg):
     start()
 
 def on_open(ws):
-    print("[INFO] Conectado - Fees: 70/75/151/303/410/412 + Taproot")
+    print("[INFO] Conectado - Sizes: 70/75/151/303/410/412 + fee 151")
     send_telegram(
-        "🟢 <b>Mempool Bot v6 iniciado</b>\n"
-        "Filtro activo por <b>comisión (fee)</b>:\n"
-        "• 70 / 75 / 151 / 303 / 410 / 412 sats\n"
-        "• + Taproot + SegWit + RBF off"
+        "🟢 <b>Mempool Bot v5 iniciado</b>\n"
+        "Filtro activo:\n"
+        "• Size: <b>70, 75, 151, 303, 410, 412 bytes</b>\n"
+        "• Fee: <b>151 sats</b>\n"
+        "• Taproot + SegWit + RBF off"
     )
     ws.send(json.dumps({"track-mempool": True}))
 
@@ -251,5 +275,5 @@ def start():
     ws.run_forever(ping_interval=25, ping_timeout=10)
 
 if __name__ == "__main__":
-    print("Iniciando Mempool Bot v6...")
+    print("Iniciando Mempool Bot v5...")
     start()
