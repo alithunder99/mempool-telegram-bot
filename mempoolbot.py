@@ -4,6 +4,7 @@ Mempool Monitor → Telegram
 Filtro: fee 70/75/151/303/410/412 sats
 + Taproot + SegWit + RBF disabled
 + Sin OP_RETURN
++ Fingerprinting heurístico de patrones Muun / Submarine Swaps Lightning
 """
 
 import os
@@ -71,6 +72,170 @@ def has_op_return(tx: dict) -> bool:
         if script.startswith("6a"):  # OP_RETURN en hex
             return True
     return False
+
+# ============================================================
+# Fingerprinting heurístico de Muun / Submarine Swaps
+# Basado en investigación pública de wallet fingerprinting
+# (p.ej. estudios de Belcher / AntoineFerron sobre Muun).
+# ⚠️ Esto es una heurística de patrones estructurales de script,
+# NO una certeza absoluta. Puede producir falsos positivos y
+# NO permite inferir identidad, ubicación geográfica ni IP.
+# ============================================================
+
+# Contador en memoria de matches por familia de fee.
+# Solo estadísticas agregadas de patrones de transacción.
+FEE_STATS = {
+    70: {"total": 0, "muun": 0},
+    75: {"total": 0, "muun": 0},
+    151: {"total": 0, "muun": 0},
+    303: {"total": 0, "muun": 0},
+    410: {"total": 0, "muun": 0},
+    412: {"total": 0, "muun": 0},
+}
+MATCH_COUNT = 0
+
+
+def detect_muun_pattern(tx: dict) -> tuple:
+    """
+    Heurística para reconocer transacciones típicas de Muun wallet.
+
+    Muun usa:
+      - P2WSH con estructura tipo HTLC (hashlock + timelock) cuando
+        el fondo proviene de/hacia un submarine swap Lightning.
+      - P2WPKH "normal" cuando no hay swap involucrado.
+
+    Señales que buscamos (no concluyentes por sí solas):
+      - scriptpubkey_type "v0_p2wsh" en los prevouts de los inputs.
+      - Witness con varios elementos en el stack (firma + preimage +
+        script de redención), típico de scripts HTLC.
+      - Tamaño del witness script coherente con un HTLC (más grande
+        que un simple P2WPKH firmado).
+
+    Devuelve: (score: int 0-100, razon: str)
+    """
+    score = 0
+    razones = []
+
+    p2wsh_inputs = 0
+    htlc_like_witness = 0
+    total_inputs = 0
+
+    for vin in tx.get("vin", []):
+        prevout = vin.get("prevout") or {}
+        spk_type = prevout.get("scriptpubkey_type", "")
+        witness = vin.get("witness") or []
+        total_inputs += 1
+
+        if spk_type == "v0_p2wsh":
+            p2wsh_inputs += 1
+
+        # Un P2WPKH normal tiene witness de 2 elementos: [firma, pubkey].
+        # Un HTLC típico (submarine swap) suele tener 3+ elementos:
+        # [firma, preimage/OP_0, redeem_script], y el redeem_script
+        # (último elemento) suele ser notablemente más largo (>100 bytes hex).
+        if len(witness) >= 3:
+            redeem_script = witness[-1] if witness else ""
+            if isinstance(redeem_script, str) and len(redeem_script) > 100:
+                htlc_like_witness += 1
+
+    if total_inputs == 0:
+        return 0, "Sin inputs analizables"
+
+    if p2wsh_inputs > 0:
+        score += 40
+        razones.append(f"{p2wsh_inputs}/{total_inputs} inputs P2WSH")
+
+    if htlc_like_witness > 0:
+        score += 45
+        razones.append(f"{htlc_like_witness} witness con estructura tipo HTLC")
+
+    # Muun también usa outputs P2WSH para depósitos de swap-in en curso.
+    p2wsh_outputs = sum(
+        1 for v in tx.get("vout", []) if v.get("scriptpubkey_type") == "v0_p2wsh"
+    )
+    if p2wsh_outputs > 0:
+        score += 15
+        razones.append(f"{p2wsh_outputs} outputs P2WSH")
+
+    score = min(score, 100)
+    razon = "; ".join(razones) if razones else "Sin señales de patrón Muun/HTLC"
+    return score, razon
+
+
+def classify_swap_direction(tx: dict) -> tuple:
+    """
+    Clasifica heurísticamente la dirección de un posible submarine swap:
+      - "swap-in": el usuario envía fondos on-chain para recibir Lightning
+        (input propio → output tipo HTLC/P2WSH, depósito en curso).
+      - "swap-out": el usuario recibe fondos on-chain tras una operación
+        Lightning (input tipo HTLC/P2WSH → output propio, retiro liquidado).
+      - "indeterminado": no hay señales suficientes para decidir.
+
+    Esta clasificación es heurística y estructural, basada solo en el
+    flujo de valor y la presencia de scripts HTLC. No infiere identidad
+    ni ubicación de las partes involucradas.
+    """
+    try:
+        inputs_p2wsh = 0
+        inputs_htlc = 0
+        for vin in tx.get("vin", []):
+            prevout = vin.get("prevout") or {}
+            witness = vin.get("witness") or []
+            if prevout.get("scriptpubkey_type") == "v0_p2wsh":
+                inputs_p2wsh += 1
+            if len(witness) >= 3:
+                redeem_script = witness[-1] if witness else ""
+                if isinstance(redeem_script, str) and len(redeem_script) > 100:
+                    inputs_htlc += 1
+
+        outputs_p2wsh = sum(
+            1 for v in tx.get("vout", []) if v.get("scriptpubkey_type") == "v0_p2wsh"
+        )
+
+        # Si el HTLC se está "gastando" desde un input (liquidando el swap),
+        # y el output es una dirección normal (p2wpkh/p2tr), parece un
+        # retiro (swap-out): los fondos Lightning ya se convirtieron a on-chain.
+        if inputs_htlc > 0 and outputs_p2wsh == 0:
+            return "swap-out", (
+                f"{inputs_htlc} input(s) liquidan un script HTLC hacia "
+                "una dirección normal (posible retiro Lightning→on-chain)"
+            )
+
+        # Si el output es P2WSH (se está creando un HTLC) y los inputs son
+        # direcciones normales, parece un depósito en curso (swap-in).
+        if outputs_p2wsh > 0 and inputs_htlc == 0:
+            return "swap-in", (
+                f"{outputs_p2wsh} output(s) crean un script P2WSH/HTLC "
+                "(posible depósito on-chain→Lightning en curso)"
+            )
+
+        if inputs_p2wsh > 0 or outputs_p2wsh > 0:
+            return "indeterminado", "Hay P2WSH pero el flujo no es concluyente"
+
+        return "indeterminado", "Sin señales de submarine swap"
+    except Exception as e:
+        return "indeterminado", f"Error al clasificar: {e}"
+
+
+def update_fee_stats(fee: int, muun_score: int):
+    """Actualiza contadores agregados por familia de fee. Solo estadísticas
+    de patrones de transacción; no almacena IP, ubicación ni datos personales."""
+    global MATCH_COUNT
+    if fee in FEE_STATS:
+        FEE_STATS[fee]["total"] += 1
+        if muun_score >= 50:
+            FEE_STATS[fee]["muun"] += 1
+    MATCH_COUNT += 1
+
+
+def build_fee_stats_summary() -> str:
+    lines = ["📊 <b>Resumen agregado por familia de fee</b>"]
+    for fee_val, stats in FEE_STATS.items():
+        lines.append(
+            f"• {fee_val} sats → {stats['total']} matches | "
+            f"{stats['muun']} con patrón Muun (score≥50)"
+        )
+    return "\n".join(lines)
 
 def matches_criteria(tx: dict) -> bool:
     fee = tx.get("fee")
@@ -179,6 +344,30 @@ Monto estimado Lightning: <b>{ln_amount} sats</b>
 ({ln_reason})
 """
 
+    # Fingerprinting Muun / clasificación de swap (heurístico, con protección)
+    muun_score, muun_reason = 0, "No evaluado"
+    swap_direction, swap_reason = "indeterminado", "No evaluado"
+    try:
+        muun_score, muun_reason = detect_muun_pattern(tx)
+    except Exception as e:
+        muun_reason = f"Error en heurística Muun: {e}"
+    try:
+        swap_direction, swap_reason = classify_swap_direction(tx)
+    except Exception as e:
+        swap_reason = f"Error en clasificación de swap: {e}"
+
+    try:
+        update_fee_stats(fee, muun_score)
+    except Exception:
+        pass
+
+    fingerprint_text = f"""
+🔍 <b>Fingerprint Muun</b>: {muun_score}/100
+   ({muun_reason})
+🔁 <b>Dirección swap</b>: <b>{swap_direction}</b>
+   ({swap_reason})
+"""
+
     # Historial
     history_text = ""
     if origin_addresses:
@@ -216,17 +405,24 @@ Monto estimado Lightning: <b>{ln_amount} sats</b>
 📊 Fee rate: <b>{fee_rate:.2f} sat/vB</b>
 📥 Inputs: <b>{num_inputs}</b> | 📤 Outputs: <b>{num_outputs}</b>
 🕒 Primera vez: {ts_to_str(first_seen)}
-{lightning_text}{ancestors_text}
+{lightning_text}{fingerprint_text}{ancestors_text}
 📥 <b>Inputs:</b>
 {inputs_text}
 📤 <b>Outputs:</b>
 {outputs_text}
 {history_text}
-— Mempool Bot v9 (Sin OP_RETURN)
+— Mempool Bot v10 (Muun/Swap fingerprinting)
 """
 
-    print(f"[MATCH] {txid} | size={size} | fee={fee} | LN estimado={ln_amount}")
+    print(f"[MATCH] {txid} | size={size} | fee={fee} | LN estimado={ln_amount} | Muun={muun_score} | swap={swap_direction}")
     send_telegram(msg.strip())
+
+    # Resumen agregado cada 20 matches
+    try:
+        if MATCH_COUNT % 20 == 0:
+            send_telegram(build_fee_stats_summary())
+    except Exception:
+        pass
 
 def on_message(ws, message):
     try:
@@ -248,13 +444,14 @@ def on_close(ws, close_status_code, close_msg):
     start()
 
 def on_open(ws):
-    print("[INFO] Conectado - Fee filter + Sin OP_RETURN")
+    print("[INFO] Conectado - Fee filter + Sin OP_RETURN + Muun fingerprinting")
     send_telegram(
-        "🟢 <b>Mempool Bot v9 iniciado</b>\n"
+        "🟢 <b>Mempool Bot v10 iniciado</b>\n"
         "Filtro activo:\n"
         "• Fee: <b>70 / 75 / 151 / 303 / 410 / 412 sats</b>\n"
         "• Taproot + SegWit + RBF off\n"
-        "• <b>Sin OP_RETURN</b>"
+        "• <b>Sin OP_RETURN</b>\n"
+        "• Fingerprinting heurístico de patrones Muun/Swap"
     )
     ws.send(json.dumps({"track-mempool": True}))
 
@@ -269,5 +466,5 @@ def start():
     ws.run_forever(ping_interval=25, ping_timeout=10)
 
 if __name__ == "__main__":
-    print("Iniciando Mempool Bot v9...")
+    print("Iniciando Mempool Bot v10...")
     start()
