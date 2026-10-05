@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-Mempool Monitor → Telegram
-Filtro: fee 70/75/151/303/410/412 sats
-+ Taproot + SegWit + RBF disabled
-+ Sin OP_RETURN
-+ Fingerprinting heurístico de patrones Muun / Submarine Swaps Lightning
+Mempool Monitor → Telegram  (v11, Muun only)
+
+Filtros estrictos:
+  - Fee total: 151 o 303 sats
+  - Al menos un input Taproot + SegWit + RBF desactivado + sin OP_RETURN
+  - Monto del pago: MIN_SATS < monto < MAX_SATS (por defecto 600 < x < 30000)
+Lógica Muun / submarine swap:
+  - Un pago Lightning saliente de Muun es una tx on-chain que crea un output
+    P2WSH (HTLC del swap). Ese output se usa como "monto del pago".
+  - Si no hay output P2WSH, se trata como pago on-chain normal.
+  - Regla de la Recovery Tool: fee 151 si monto < 20k, fee 303 si monto >= 20k.
+Heurística: NO es certeza absoluta, puede haber falsos positivos.
 """
 
 import os
 import json
 import time
-import requests
+import queue
+import threading
+from collections import deque
 from datetime import datetime, timezone
+
+import requests
 from websocket import WebSocketApp
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -20,17 +31,32 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WS_URL = "wss://mempool.space/api/v1/ws"
 API_BASE = "https://mempool.space/api"
 
+ALLOWED_FEES = (151, 303)
+MIN_SATS = int(os.getenv("MIN_SATS", "600"))      # estricto: monto > MIN_SATS
+MAX_SATS = int(os.getenv("MAX_SATS", "30000"))    # estricto: monto < MAX_SATS
+FEE_SPLIT = int(os.getenv("FEE_SPLIT", "20000"))  # 151 por debajo, 303 desde aquí
+
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     print("❌ Faltan las variables TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
-    exit(1)
+    raise SystemExit(1)
 
+FEE_STATS = {f: {"total": 0, "muun": 0} for f in ALLOWED_FEES}
+MATCH_COUNT = 0
+SEEN = deque(maxlen=5000)
+SEEN_SET = set()
+NOTIFY_Q = queue.Queue()
+
+
+# ------------------------------------------------------------------
+# Telegram
+# ------------------------------------------------------------------
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "disable_web_page_preview": False,
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
@@ -39,432 +65,296 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"[Telegram Exception] {e}")
 
+
+# ------------------------------------------------------------------
+# Filtros básicos
+# ------------------------------------------------------------------
 def is_rbf_disabled(tx: dict) -> bool:
-    for vin in tx.get("vin", []):
-        if vin.get("sequence", 0xffffffff) < 0xfffffffe:
-            return False
-    return True
+    return all(v.get("sequence", 0xffffffff) >= 0xfffffffe for v in tx.get("vin", []))
+
 
 def has_taproot_input(tx: dict) -> bool:
-    for vin in tx.get("vin", []):
-        prevout = vin.get("prevout") or {}
-        if prevout.get("scriptpubkey_type") == "v1_p2tr":
-            return True
-    return False
+    return any(
+        (v.get("prevout") or {}).get("scriptpubkey_type") == "v1_p2tr"
+        for v in tx.get("vin", [])
+    )
+
 
 def has_segwit(tx: dict) -> bool:
-    for vin in tx.get("vin", []):
-        if vin.get("witness"):
-            return True
-    for vout in tx.get("vout", []):
-        if vout.get("scriptpubkey_type") in ("v0_p2wpkh", "v0_p2wsh", "v1_p2tr"):
-            return True
-    return False
+    if any(v.get("witness") for v in tx.get("vin", [])):
+        return True
+    return any(
+        v.get("scriptpubkey_type") in ("v0_p2wpkh", "v0_p2wsh", "v1_p2tr")
+        for v in tx.get("vout", [])
+    )
+
 
 def has_op_return(tx: dict) -> bool:
-    """Devuelve True si la transacción tiene alguna salida OP_RETURN"""
-    for vout in tx.get("vout", []):
-        script_type = vout.get("scriptpubkey_type", "")
-        if script_type == "op_return" or script_type == "nulldata":
+    for v in tx.get("vout", []):
+        if v.get("scriptpubkey_type") in ("op_return", "nulldata"):
             return True
-        # También revisamos el scriptpubkey por si acaso
-        script = vout.get("scriptpubkey", "")
-        if script.startswith("6a"):  # OP_RETURN en hex
+        if v.get("scriptpubkey", "").startswith("6a"):
             return True
     return False
 
-# ============================================================
-# Fingerprinting heurístico de Muun / Submarine Swaps
-# Basado en investigación pública de wallet fingerprinting
-# (p.ej. estudios de Belcher / AntoineFerron sobre Muun).
-# ⚠️ Esto es una heurística de patrones estructurales de script,
-# NO una certeza absoluta. Puede producir falsos positivos y
-# NO permite inferir identidad, ubicación geográfica ni IP.
-# ============================================================
 
-# Contador en memoria de matches por familia de fee.
-# Solo estadísticas agregadas de patrones de transacción.
-FEE_STATS = {
-    70: {"total": 0, "muun": 0},
-    75: {"total": 0, "muun": 0},
-    151: {"total": 0, "muun": 0},
-    303: {"total": 0, "muun": 0},
-    410: {"total": 0, "muun": 0},
-    412: {"total": 0, "muun": 0},
-}
-MATCH_COUNT = 0
+# ------------------------------------------------------------------
+# Lógica de pago / submarine swap
+# ------------------------------------------------------------------
+def swap_outputs(tx: dict) -> list:
+    """Outputs P2WSH = posible HTLC de un submarine swap (pago Lightning)."""
+    return [v for v in tx.get("vout", []) if v.get("scriptpubkey_type") == "v0_p2wsh"]
 
 
-def detect_muun_pattern(tx: dict) -> tuple:
-    """
-    Heurística para reconocer transacciones típicas de Muun wallet.
-
-    Muun usa:
-      - P2WSH con estructura tipo HTLC (hashlock + timelock) cuando
-        el fondo proviene de/hacia un submarine swap Lightning.
-      - P2WPKH "normal" cuando no hay swap involucrado.
-
-    Señales que buscamos (no concluyentes por sí solas):
-      - scriptpubkey_type "v0_p2wsh" en los prevouts de los inputs.
-      - Witness con varios elementos en el stack (firma + preimage +
-        script de redención), típico de scripts HTLC.
-      - Tamaño del witness script coherente con un HTLC (más grande
-        que un simple P2WPKH firmado).
-
-    Devuelve: (score: int 0-100, razon: str)
-    """
-    score = 0
-    razones = []
-
-    p2wsh_inputs = 0
-    htlc_like_witness = 0
-    total_inputs = 0
-
-    for vin in tx.get("vin", []):
-        prevout = vin.get("prevout") or {}
-        spk_type = prevout.get("scriptpubkey_type", "")
-        witness = vin.get("witness") or []
-        total_inputs += 1
-
-        if spk_type == "v0_p2wsh":
-            p2wsh_inputs += 1
-
-        # Un P2WPKH normal tiene witness de 2 elementos: [firma, pubkey].
-        # Un HTLC típico (submarine swap) suele tener 3+ elementos:
-        # [firma, preimage/OP_0, redeem_script], y el redeem_script
-        # (último elemento) suele ser notablemente más largo (>100 bytes hex).
-        if len(witness) >= 3:
-            redeem_script = witness[-1] if witness else ""
-            if isinstance(redeem_script, str) and len(redeem_script) > 100:
-                htlc_like_witness += 1
-
-    if total_inputs == 0:
-        return 0, "Sin inputs analizables"
-
-    if p2wsh_inputs > 0:
-        score += 40
-        razones.append(f"{p2wsh_inputs}/{total_inputs} inputs P2WSH")
-
-    if htlc_like_witness > 0:
-        score += 45
-        razones.append(f"{htlc_like_witness} witness con estructura tipo HTLC")
-
-    # Muun también usa outputs P2WSH para depósitos de swap-in en curso.
-    p2wsh_outputs = sum(
-        1 for v in tx.get("vout", []) if v.get("scriptpubkey_type") == "v0_p2wsh"
-    )
-    if p2wsh_outputs > 0:
-        score += 15
-        razones.append(f"{p2wsh_outputs} outputs P2WSH")
-
-    score = min(score, 100)
-    razon = "; ".join(razones) if razones else "Sin señales de patrón Muun/HTLC"
-    return score, razon
+def payment_candidates(tx: dict) -> tuple:
+    """Devuelve (outputs candidatos a ser el pago, tipo)."""
+    swaps = swap_outputs(tx)
+    if swaps:
+        return swaps, "swap (pago Lightning)"
+    return tx.get("vout", []), "on-chain"
 
 
-def classify_swap_direction(tx: dict) -> tuple:
-    """
-    Clasifica heurísticamente la dirección de un posible submarine swap:
-      - "swap-in": el usuario envía fondos on-chain para recibir Lightning
-        (input propio → output tipo HTLC/P2WSH, depósito en curso).
-      - "swap-out": el usuario recibe fondos on-chain tras una operación
-        Lightning (input tipo HTLC/P2WSH → output propio, retiro liquidado).
-      - "indeterminado": no hay señales suficientes para decidir.
-
-    Esta clasificación es heurística y estructural, basada solo en el
-    flujo de valor y la presencia de scripts HTLC. No infiere identidad
-    ni ubicación de las partes involucradas.
-    """
-    try:
-        inputs_p2wsh = 0
-        inputs_htlc = 0
-        for vin in tx.get("vin", []):
-            prevout = vin.get("prevout") or {}
-            witness = vin.get("witness") or []
-            if prevout.get("scriptpubkey_type") == "v0_p2wsh":
-                inputs_p2wsh += 1
-            if len(witness) >= 3:
-                redeem_script = witness[-1] if witness else ""
-                if isinstance(redeem_script, str) and len(redeem_script) > 100:
-                    inputs_htlc += 1
-
-        outputs_p2wsh = sum(
-            1 for v in tx.get("vout", []) if v.get("scriptpubkey_type") == "v0_p2wsh"
-        )
-
-        # Si el HTLC se está "gastando" desde un input (liquidando el swap),
-        # y el output es una dirección normal (p2wpkh/p2tr), parece un
-        # retiro (swap-out): los fondos Lightning ya se convirtieron a on-chain.
-        if inputs_htlc > 0 and outputs_p2wsh == 0:
-            return "swap-out", (
-                f"{inputs_htlc} input(s) liquidan un script HTLC hacia "
-                "una dirección normal (posible retiro Lightning→on-chain)"
-            )
-
-        # Si el output es P2WSH (se está creando un HTLC) y los inputs son
-        # direcciones normales, parece un depósito en curso (swap-in).
-        if outputs_p2wsh > 0 and inputs_htlc == 0:
-            return "swap-in", (
-                f"{outputs_p2wsh} output(s) crean un script P2WSH/HTLC "
-                "(posible depósito on-chain→Lightning en curso)"
-            )
-
-        if inputs_p2wsh > 0 or outputs_p2wsh > 0:
-            return "indeterminado", "Hay P2WSH pero el flujo no es concluyente"
-
-        return "indeterminado", "Sin señales de submarine swap"
-    except Exception as e:
-        return "indeterminado", f"Error al clasificar: {e}"
+def amount_in_range(value: int) -> bool:
+    return MIN_SATS < value < MAX_SATS
 
 
-def update_fee_stats(fee: int, muun_score: int):
-    """Actualiza contadores agregados por familia de fee. Solo estadísticas
-    de patrones de transacción; no almacena IP, ubicación ni datos personales."""
-    global MATCH_COUNT
-    if fee in FEE_STATS:
-        FEE_STATS[fee]["total"] += 1
-        if muun_score >= 50:
-            FEE_STATS[fee]["muun"] += 1
-    MATCH_COUNT += 1
+def payment_hits(tx: dict) -> tuple:
+    cands, kind = payment_candidates(tx)
+    hits = [v for v in cands if amount_in_range(v.get("value", 0))]
+    return hits, kind
 
 
-def build_fee_stats_summary() -> str:
-    lines = ["📊 <b>Resumen agregado por familia de fee</b>"]
-    for fee_val, stats in FEE_STATS.items():
-        lines.append(
-            f"• {fee_val} sats → {stats['total']} matches | "
-            f"{stats['muun']} con patrón Muun (score≥50)"
-        )
-    return "\n".join(lines)
+def withdrawal_amount(tx: dict) -> int:
+    """Monto del retiro = suma de outputs (la Recovery Tool barre todo a un destino)."""
+    return sum(v.get("value", 0) for v in tx.get("vout", []))
+
+
+def fee_matches_amount(fee: int, amount: int) -> bool:
+    """Regla fija de la Recovery Tool: 151 sats si < 20k, 303 sats si >= 20k."""
+    if not amount_in_range(amount):
+        return False
+    if fee == 151:
+        return amount < FEE_SPLIT
+    if fee == 303:
+        return amount >= FEE_SPLIT
+    return False
+
 
 def matches_criteria(tx: dict) -> bool:
     fee = tx.get("fee")
-
-    # Comisión total pagada
-    if fee not in (70, 75, 151, 303, 410, 412):
+    if fee not in ALLOWED_FEES:
         return False
-
-    # Características requeridas
+    if not fee_matches_amount(fee, withdrawal_amount(tx)):
+        return False
     if not has_taproot_input(tx):
         return False
     if not has_segwit(tx):
         return False
     if not is_rbf_disabled(tx):
         return False
-
-    # Excluir transacciones con OP_RETURN
     if has_op_return(tx):
         return False
-
     return True
 
+
+def muun_score(tx: dict) -> tuple:
+    """Score 0-100 sobre la forma de la tx de creación de swap.
+    Nota: el script HTLC dentro del P2WSH NO es visible hasta que se gasta,
+    por eso solo se puede puntuar la estructura externa de la tx."""
+    score, reasons = 0, []
+    vins = tx.get("vin", [])
+    vouts = tx.get("vout", [])
+    if not vins:
+        return 0, "Sin inputs"
+
+    types = [(v.get("prevout") or {}).get("scriptpubkey_type") for v in vins]
+    if all(t == "v1_p2tr" for t in types):
+        score += 30
+        reasons.append("todos los inputs P2TR")
+        if all(len(v.get("witness") or []) == 1 for v in vins):
+            score += 20
+            reasons.append("key-path (1 elemento de witness)")
+
+    swaps = swap_outputs(tx)
+    if len(swaps) == 1:
+        score += 25
+        reasons.append("1 output P2WSH (posible HTLC swap)")
+        others = [v for v in vouts if v.get("scriptpubkey_type") != "v0_p2wsh"]
+        if len(others) == 0:
+            score += 10
+            reasons.append("sin cambio")
+        elif len(others) == 1 and others[0].get("scriptpubkey_type") == "v1_p2tr":
+            score += 10
+            reasons.append("cambio P2TR")
+
+    score = min(score, 100)
+    return score, "; ".join(reasons) or "Sin señales"
+
+
+# ------------------------------------------------------------------
+# Utilidades de mensaje
+# ------------------------------------------------------------------
 def ts_to_str(ts):
     if not ts:
         return "?"
     try:
         return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except:
+    except Exception:
         return str(ts)
+
+
+def short(addr: str) -> str:
+    return f"{addr[:16]}...{addr[-6:]}" if len(addr) > 24 else addr
+
 
 def get_address_txs(address: str, limit=5):
     try:
         r = requests.get(f"{API_BASE}/address/{address}/txs", timeout=12)
         if r.status_code == 200:
             return r.json()[:limit]
-    except:
+    except Exception:
         pass
     return []
 
-def estimate_lightning_amount(tx: dict) -> tuple:
-    outputs = tx.get("vout", [])
-    ancestors = tx.get("ancestors") or []
 
-    main_output = 0
-    for vout in outputs:
-        value = vout.get("value", 0)
-        if value > main_output:
-            main_output = value
+def build_fee_stats_summary() -> str:
+    lines = ["📊 <b>Resumen por fee</b>"]
+    for fee_val, s in FEE_STATS.items():
+        lines.append(f"• {fee_val} sats → {s['total']} matches | {s['muun']} con score≥50")
+    return "\n".join(lines)
 
-    if len(outputs) == 1:
-        return main_output, "Output único"
-
-    if len(outputs) == 2:
-        values = sorted([v.get("value", 0) for v in outputs], reverse=True)
-        return values[0], "Output principal (posible pago)"
-
-    if ancestors:
-        return main_output, f"Con {len(ancestors)} ancestors"
-
-    return main_output, "Estimación básica"
 
 def analyze_and_notify(tx: dict):
+    global MATCH_COUNT
     txid = tx.get("txid")
     fee = tx.get("fee", 0)
     size = tx.get("size")
-    first_seen = tx.get("firstSeen")
     fee_rate = tx.get("feePerVsize") or tx.get("effectiveFeePerVsize") or 0
 
-    num_inputs = len(tx.get("vin", []))
-    num_outputs = len(tx.get("vout", []))
+    _, kind = payment_candidates(tx)
+    amount = withdrawal_amount(tx)
+    score, reason = muun_score(tx)
 
-    # Inputs
-    inputs_text = ""
-    origin_addresses = []
+    if fee in FEE_STATS:
+        FEE_STATS[fee]["total"] += 1
+        if score >= 50:
+            FEE_STATS[fee]["muun"] += 1
+    MATCH_COUNT += 1
 
+    inputs_text, origin = "", []
     for vin in tx.get("vin", []):
-        prevout = vin.get("prevout") or {}
-        addr = prevout.get("scriptpubkey_address", "?")
-        value = prevout.get("value", 0)
-        spk = prevout.get("scriptpubkey_type", "?")
-        inputs_text += f"• {value} sats ← <code>{addr[:16]}...{addr[-6:]}</code> ({spk})\n"
+        p = vin.get("prevout") or {}
+        addr = p.get("scriptpubkey_address", "?")
+        inputs_text += f"• {p.get('value', 0)} sats ← <code>{short(addr)}</code> ({p.get('scriptpubkey_type', '?')})\n"
         if addr.startswith("bc1"):
-            origin_addresses.append(addr)
+            origin.append(addr)
 
-    # Outputs
     outputs_text = ""
-    for vout in tx.get("vout", []):
-        addr = vout.get("scriptpubkey_address") or "OP_RETURN"
-        value = vout.get("value", 0)
-        spk = vout.get("scriptpubkey_type", "?")
-        outputs_text += f"• {value} sats → <code>{addr[:16]}...{addr[-6:]}</code> ({spk})\n"
+    for v in tx.get("vout", []):
+        addr = v.get("scriptpubkey_address") or "?"
+        outputs_text += f"• {v.get('value', 0)} sats → <code>{short(addr)}</code> ({v.get('scriptpubkey_type', '?')})\n"
 
-    # Ancestors
-    ancestors = tx.get("ancestors") or []
-    effective_fee = tx.get("effectiveFeePerVsize") or fee_rate
-    ancestors_text = ""
-    if ancestors:
-        ancestors_text = f"\n🔗 Ancestors: {len(ancestors)} | Fee efectiva: <b>{effective_fee:.2f} sat/vB</b>\n"
+    seqs = sorted({hex(v.get("sequence", 0)) for v in tx.get("vin", [])})
+    raw_info = f"version={tx.get('version')} | locktime={tx.get('locktime')} | sequence={', '.join(seqs)}"
 
-    # Estimación Lightning
-    ln_amount, ln_reason = estimate_lightning_amount(tx)
-
-    lightning_text = f"""
-⚡ <b>Posible pago Lightning (patrón Muun/Swap)</b>
-Monto estimado Lightning: <b>{ln_amount} sats</b>
-({ln_reason})
-"""
-
-    # Fingerprinting Muun / clasificación de swap (heurístico, con protección)
-    muun_score, muun_reason = 0, "No evaluado"
-    swap_direction, swap_reason = "indeterminado", "No evaluado"
-    try:
-        muun_score, muun_reason = detect_muun_pattern(tx)
-    except Exception as e:
-        muun_reason = f"Error en heurística Muun: {e}"
-    try:
-        swap_direction, swap_reason = classify_swap_direction(tx)
-    except Exception as e:
-        swap_reason = f"Error en clasificación de swap: {e}"
-
-    try:
-        update_fee_stats(fee, muun_score)
-    except Exception:
-        pass
-
-    fingerprint_text = f"""
-🔍 <b>Fingerprint Muun</b>: {muun_score}/100
-   ({muun_reason})
-🔁 <b>Dirección swap</b>: <b>{swap_direction}</b>
-   ({swap_reason})
-"""
-
-    # Historial
     history_text = ""
-    if origin_addresses:
-        addr = origin_addresses[0]
-        txs = get_address_txs(addr, limit=4)
-        txs = list(reversed(txs))
-
-        history_text = "\n📜 Origen de los fondos:\n"
+    if origin:
+        txs = list(reversed(get_address_txs(origin[0], limit=4)))
+        if txs:
+            history_text = "\n📜 Origen de los fondos:\n"
         for t in txs[:3]:
-            status = t.get("status", {})
-            confirmed = status.get("confirmed", False)
-            block_time = status.get("block_time")
-            t_txid = t.get("txid", "")[:10] + "..."
-            time_str = ts_to_str(block_time) if confirmed else "mempool"
-
-            received = sum(v.get("value", 0) for v in t.get("vout", []) if v.get("scriptpubkey_address") == addr)
-            sent = 0
-            for vin in t.get("vin", []):
-                prev = vin.get("prevout") or {}
-                if prev.get("scriptpubkey_address") == addr:
-                    sent += prev.get("value", 0)
-
-            if received:
-                history_text += f"• {time_str} | recibió {received} sats | <code>{t_txid}</code>\n"
-            elif sent:
-                history_text += f"• {time_str} | envió {sent} sats | <code>{t_txid}</code>\n"
+            st = t.get("status", {})
+            when = ts_to_str(st.get("block_time")) if st.get("confirmed") else "mempool"
+            addr = origin[0]
+            recv = sum(o.get("value", 0) for o in t.get("vout", []) if o.get("scriptpubkey_address") == addr)
+            sent = sum((i.get("prevout") or {}).get("value", 0) for i in t.get("vin", [])
+                       if (i.get("prevout") or {}).get("scriptpubkey_address") == addr)
+            verb, val = ("recibió", recv) if recv else ("envió", sent)
+            history_text += f"• {when} | {verb} {val} sats | <code>{t.get('txid', '')[:10]}...</code>\n"
 
     msg = f"""
-🎯 <b>MATCH DETECTADO</b>
+🎯 <b>MATCH MUUN</b> — {kind}
 
 <code>{txid}</code>
 🔗 https://mempool.space/tx/{txid}
 
-📦 Size: <b>{size} bytes</b> | Fee: <b>{fee} sats</b>
-📊 Fee rate: <b>{fee_rate:.2f} sat/vB</b>
-📥 Inputs: <b>{num_inputs}</b> | 📤 Outputs: <b>{num_outputs}</b>
-🕒 Primera vez: {ts_to_str(first_seen)}
-{lightning_text}{fingerprint_text}{ancestors_text}
+💰 Monto del retiro: <b>{amount} sats</b>
+📦 Size: <b>{size} bytes</b> | Fee: <b>{fee} sats</b> ({fee_rate:.2f} sat/vB)
+🔍 Score Muun: <b>{score}/100</b>
+   ({reason})
+🧬 {raw_info}
+
 📥 <b>Inputs:</b>
 {inputs_text}
 📤 <b>Outputs:</b>
-{outputs_text}
-{history_text}
-— Mempool Bot v10 (Muun/Swap fingerprinting)
+{outputs_text}{history_text}
+— Mempool Bot v11 (Muun only)
 """
-
-    print(f"[MATCH] {txid} | size={size} | fee={fee} | LN estimado={ln_amount} | Muun={muun_score} | swap={swap_direction}")
+    print(f"[MATCH] {txid} | fee={fee} | monto={amount} | {kind} | score={score}")
     send_telegram(msg.strip())
 
-    # Resumen agregado cada 20 matches
-    try:
-        if MATCH_COUNT % 20 == 0:
-            send_telegram(build_fee_stats_summary())
-    except Exception:
-        pass
+    if MATCH_COUNT % 20 == 0:
+        send_telegram(build_fee_stats_summary())
 
+
+def worker():
+    """Procesa notificaciones fuera del hilo del websocket (evita bloquearlo)."""
+    while True:
+        tx = NOTIFY_Q.get()
+        try:
+            analyze_and_notify(tx)
+        except Exception as e:
+            print(f"[Worker Error] {e}")
+
+
+# ------------------------------------------------------------------
+# WebSocket
+# ------------------------------------------------------------------
 def on_message(ws, message):
     try:
         data = json.loads(message)
-    except:
+    except Exception:
         return
+    for tx in data.get("mempool-transactions", {}).get("added", []):
+        try:
+            txid = tx.get("txid")
+            if txid in SEEN_SET:
+                continue
+            if matches_criteria(tx):
+                if len(SEEN) == SEEN.maxlen:
+                    SEEN_SET.discard(SEEN[0])
+                SEEN.append(txid)
+                SEEN_SET.add(txid)
+                NOTIFY_Q.put(tx)
+        except Exception as e:
+            print(f"[Filter Error] {e}")
 
-    added = data.get("mempool-transactions", {}).get("added", [])
-    for tx in added:
-        if matches_criteria(tx):
-            analyze_and_notify(tx)
 
 def on_error(ws, error):
     print(f"[ERROR] {error}")
 
-def on_close(ws, close_status_code, close_msg):
-    print("[INFO] Conexión cerrada. Reconectando en 8s...")
-    time.sleep(8)
-    start()
 
 def on_open(ws):
-    print("[INFO] Conectado - Fee filter + Sin OP_RETURN + Muun fingerprinting")
+    print("[INFO] Conectado - Muun only (fee 151/303, 600-30000 sats)")
     send_telegram(
-        "🟢 <b>Mempool Bot v10 iniciado</b>\n"
-        "Filtro activo:\n"
-        "• Fee: <b>70 / 75 / 151 / 303 / 410 / 412 sats</b>\n"
-        "• Taproot + SegWit + RBF off\n"
-        "• <b>Sin OP_RETURN</b>\n"
-        "• Fingerprinting heurístico de patrones Muun/Swap"
+        "🟢 <b>Mempool Bot v11 iniciado</b>\n"
+        f"• Fee: <b>{' / '.join(map(str, ALLOWED_FEES))} sats</b>\n"
+        f"• Monto: <b>{MIN_SATS} &lt; x &lt; {MAX_SATS} sats</b>\n"
+        "• Taproot + SegWit + RBF off + sin OP_RETURN\n"
+        f"• 151 sats si &lt; {FEE_SPLIT} | 303 sats si ≥ {FEE_SPLIT} (Recovery Tool)"
     )
     ws.send(json.dumps({"track-mempool": True}))
 
-def start():
-    ws = WebSocketApp(
-        WS_URL,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    )
-    ws.run_forever(ping_interval=25, ping_timeout=10)
+
+def main():
+    threading.Thread(target=worker, daemon=True).start()
+    while True:  # reconexión en bucle (sin recursión)
+        ws = WebSocketApp(WS_URL, on_open=on_open, on_message=on_message, on_error=on_error)
+        ws.run_forever(ping_interval=25, ping_timeout=10)
+        print("[INFO] Conexión cerrada. Reconectando en 8s...")
+        time.sleep(8)
+
 
 if __name__ == "__main__":
-    print("Iniciando Mempool Bot v10...")
-    start()
+    print("Iniciando Mempool Bot v11...")
+    main()
